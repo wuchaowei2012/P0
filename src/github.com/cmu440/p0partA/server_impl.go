@@ -90,7 +90,6 @@ func (kvs *keyValueServer) Start(port int) error {
 }
 
 func (kvs *keyValueServer) readStuff(conn net.Conn){
-	fmt.Println("has started in parseResq: ", conn)
 	// 为什么要将 conn 杀掉
 	defer conn.Close()
 
@@ -103,7 +102,6 @@ func (kvs *keyValueServer) readStuff(conn net.Conn){
 
 	// 根据conn 发送response
 	for{
-		fmt.Println("entered forloop @ readStuff:", 20001)
 		// func (b *Reader) ReadBytes(delim byte) ([]byte, error)
 		// ReadBytes reads until the first occurrence of delim in the input, 
 		// returning a slice containing the data up to and including the delimiter. 
@@ -113,7 +111,6 @@ func (kvs *keyValueServer) readStuff(conn net.Conn){
 		// For simple uses, a Scanner may be more convenient.
 
 		line, err := bufReader.ReadBytes('\n')
-		fmt.Println("after forloop")
 
 		if err != nil{
 			fmt.Println("erro @ ReadBytes_parseResq")
@@ -123,9 +120,8 @@ func (kvs *keyValueServer) readStuff(conn net.Conn){
 		}
 		// 写给服务器
 		// 为什么长度总是 0
-		fmt.Println("readStuff:kvs.readChan:", len(kvs.readChan))
+		// fmt.Println("readStuff:kvs.readChan:", len(kvs.readChan))
 		kvs.readChan<-line
-		fmt.Println("readStuff:line after writing onto server:", line)
 
 	}
 }
@@ -134,7 +130,7 @@ func (kvs *keyValueServer) sendStuff(conn net.Conn){
 	// channelMap map[net.Conn] chan []byte
 	sendChannel, exists := kvs.channelMap[conn]
 	if !exists{
-		fmt.Println("sendStuff: error when get value by key")
+		fmt.Println("error @ sendStuff: error when get value by key")
 		return
 	}
 	for{
@@ -150,17 +146,13 @@ func (kvs *keyValueServer) sendStuff(conn net.Conn){
 
 
 func (kvs *keyValueServer) handleOutStuff(){
-	fmt.Println("handleOutStuff:start routine")
 	for {
 		msg := <-kvs.readChan
-		fmt.Println("handleOutStuff:msg:", msg)
 		fmt.Println("handleOutStuff:total clients:",len(kvs.channelMap))
 		for _, sendChan := range kvs.channelMap{
 			// buffer channedl 的处理很新奇
-			fmt.Println("handleOutStuff: in the loop")
 			if len(sendChan) < sendChannelBufferSize{
 				sendChan <-msg
-				fmt.Println("handleOutStuff: msg sent to channel", msg)
 			} else {
 				time.Sleep(time.Duration(10)*time.Millisecond)}
 		}
