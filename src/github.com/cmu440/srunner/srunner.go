@@ -13,6 +13,7 @@ func main() {
 	store, _ := kvstore.CreateWithBackdoor()
 	// Initialize the server.
 	server := p0partA.New(store)
+	fmt.Println("in main function:", server)
 	if server == nil {
 		fmt.Println("New() returned a nil server. Exiting...")
 		return
