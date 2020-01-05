@@ -1,17 +1,18 @@
 // Implementation of a KeyValueServer. Students should write their code in this file.
 
+
 package p0partA
 
 import (
 	"github.com/cmu440/p0partA/kvstore"
-	 "fmt"
-	 "net"
-	  "strconv"
+	"fmt"
+	"net"
+	"strconv"
 	"bufio"
-	"time"
+	"bytes"
 )
 
-const sendChannelBufferSize int = 100
+const sendChannelBufferSize int = 500
 
 type keyValueServer struct {
 	// TODO: implement this!
@@ -21,6 +22,8 @@ type keyValueServer struct {
 	channelMap map[net.Conn]chan []byte
 	// 用于保存 conn 发送过来的msg 的通道
 	readChan chan []byte
+
+	store kvstore.KVStore
 }
 
 // New creates and returns (but does not start) a new KeyValueServer.
@@ -32,6 +35,8 @@ func New(store kvstore.KVStore) KeyValueServer {
 	server.listener = nil
 	server.readChan = make(chan []byte)
 	server.channelMap = make(map[net.Conn]chan []byte)
+
+	server.store = store
 	
 	// 使用接口时，返回接口类型变量， 参考 book p113
 	return &server
@@ -44,19 +49,21 @@ func (kvs *keyValueServer) Start(port int) error {
 	// 初始化 监听本地服务, 并将变量赋值给 kvs
 	listener, err := net.Listen("tcp", laddr)
 
-	// A Listener is a generic network listener for stream-oriented protocols.
-	// Multiple goroutines may invoke methods on a Listener simultaneously.
-	// type Listener interface {
-	//     // Accept waits for and returns the next connection to the listener.
-	//     Accept() (Conn, error)
+	/*
+	A Listener is a generic network listener for stream-oriented protocols.
+	Multiple goroutines may invoke methods on a Listener simultaneously.
+	type Listener interface {
+	    // Accept waits for and returns the next connection to the listener.
+	    Accept() (Conn, error)
 
-	//     // Close closes the listener.
-	//     // Any blocked Accept operations will be unblocked and return errors.
-	//     Close() error
+	    // Close closes the listener.
+	    // Any blocked Accept operations will be unblocked and return errors.
+	    Close() error
 
-	//     // Addr returns the listener's network address.
-	//     Addr() Addr
-	// }
+	    // Addr returns the listener's network address.
+	    Addr() Addr
+	}
+	*/
 
 	if err != nil {
 		fmt.Println("error in starting a listener!")
@@ -68,6 +75,8 @@ func (kvs *keyValueServer) Start(port int) error {
 
 	go kvs.handleOutStuff()
 
+
+	// Track client statuses and process DB requests
 	go func(){
         for{
 			// Conn is a generic stream-oriented network connection.
@@ -82,14 +91,14 @@ func (kvs *keyValueServer) Start(port int) error {
 			kvs.clientNum++
 
 			// 解析 connection 请求
-            go kvs.readStuff(conn)
+            go kvs.readCommd(conn)
         }
     }()
 
 	return nil
 }
 
-func (kvs *keyValueServer) readStuff(conn net.Conn){
+func (kvs *keyValueServer) readCommd(conn net.Conn){
 	// 为什么要将 conn 杀掉
 	defer conn.Close()
 
@@ -101,29 +110,68 @@ func (kvs *keyValueServer) readStuff(conn net.Conn){
 	go kvs.sendStuff(conn)
 
 	// 根据conn 发送response
+
 	for{
-		// func (b *Reader) ReadBytes(delim byte) ([]byte, error)
-		// ReadBytes reads until the first occurrence of delim in the input, 
-		// returning a slice containing the data up to and including the delimiter. 
-		// If ReadBytes encounters an error before finding a delimiter, 
-		// it returns the data read before the error and the error itself (often io.EOF). 
-		// ReadBytes returns err != nil if and only if the returned data does not end in delim.
-		// For simple uses, a Scanner may be more convenient.
+		/*
+		func (b *Reader) ReadBytes(delim byte) ([]byte, error)
+		ReadBytes reads until the first occurrence of delim in the input, 
+		returning a slice containing the data up to and including the delimiter. 
+		If ReadBytes encounters an error before finding a delimiter, 
+		it returns the data read before the error and the error itself (often io.EOF). 
+		ReadBytes returns err != nil if and only if the returned data does not end in delim.
+		For simple uses, a Scanner may be more convenient.
+		*/
 
 		line, err := bufReader.ReadBytes('\n')
+		_ = err
+		// 设计的机制是 一旦从 bufReader中不能正确读取信息，就将相应的conn杀掉
+		// if err != nil{
+		// 	fmt.Println("erro @ ReadBytes_parseResq")
+		// 	delete(kvs.channelMap, conn)
+		// 	kvs.clientNum--
+		// 	break
+		// }
 
-		if err != nil{
-			fmt.Println("erro @ ReadBytes_parseResq")
-			delete(kvs.channelMap, conn)
-			kvs.clientNum--
-			break
+		line = bytes.TrimSuffix(line, []byte("\n"))
+		cmd_list := bytes.Split(line, []byte(":"))
+
+
+		if len(cmd_list) == 3 && string(cmd_list[0]) == "Put" {
+			// fmt.Println("using Put commd :")
+			k := string(cmd_list[1])
+			v := cmd_list[2]
+
+			kvs.store.Put(k, v)
+
+		} else if len(cmd_list) == 2 && string(cmd_list[0]) == "Get" {
+			// fmt.Println("using Get commd :")
+			k := string(cmd_list[1])
+			msg := kvs.store.Get(k)
+
+			for _, item := range msg{
+				item=append(item, (byte)('\n'))
+				// item=append(item, '\n')
+				_, err := conn.Write(item)
+				if err != nil{
+					delete(kvs.channelMap, conn)
+				}
+			}
+		} else if len(cmd_list) == 2 && string(cmd_list[0]) == "Delete" {
+			// fmt.Println("using Delete commd :")
+			k := string(cmd_list[1])
+			kvs.store.Clear(k)
 		}
-		// 写给服务器
-		// 为什么长度总是 0
-		// fmt.Println("readStuff:kvs.readChan:", len(kvs.readChan))
-		kvs.readChan<-line
-
+		
+		/*
+		写给服务器
+		为什么长度总是 0
+		fmt.Println("readStuff:kvs.readChan:", len(kvs.readChan))
+		*/
+		// kvs.readChan<-msg
+	
 	}
+	
+
 }
 
 func (kvs *keyValueServer) sendStuff(conn net.Conn){
@@ -150,11 +198,10 @@ func (kvs *keyValueServer) handleOutStuff(){
 		msg := <-kvs.readChan
 		fmt.Println("handleOutStuff:total clients:",len(kvs.channelMap))
 		for _, sendChan := range kvs.channelMap{
-			// buffer channedl 的处理很新奇
+			// 大于500条的信息丢弃
 			if len(sendChan) < sendChannelBufferSize{
 				sendChan <-msg
-			} else {
-				time.Sleep(time.Duration(10)*time.Millisecond)}
+			}
 		}
 	}
 }
@@ -170,15 +217,37 @@ func (kvs *keyValueServer) Close() {
 
 func (kvs *keyValueServer) CountActive() int {
 	// TODO: implement this!
-	fmt.Println("in CountActive function",kvs.clientNum)
 	return kvs.clientNum
 }
 
 func (kvs *keyValueServer) CountDropped() int {
 	// TODO: implement this!
 
-	fmt.Println("in CountDropped function",kvs.clientNum)
 	return kvs.clientNum
 }
 
 // TODO: add additional methods/functions below!
+
+
+/*
+
+func main() {
+	var c1, c2, c3 chan int
+	var i1, i2 int
+	select {
+	   case i1 = <-c1:
+		  fmt.Printf("received ", i1, " from c1\n")
+	   case c2 <- i2:
+		  fmt.Printf("sent ", i2, " to c2\n")
+	   case i3, ok := (<-c3):  // same as: i3, ok := <-c3
+		  if ok {
+			 fmt.Printf("received ", i3, " from c3\n")
+		  } else {
+			 fmt.Printf("c3 is closed\n")
+		  }
+	   default:
+		  fmt.Printf("no communication\n")
+	}
+ }  
+
+ */

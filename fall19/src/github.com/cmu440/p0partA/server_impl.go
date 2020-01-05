@@ -1,184 +1,333 @@
-// Implementation of a KeyValueServer. Students should write their code in this file.
 
 package p0partA
 
+ // Implementation of a KeyValueServer. Students should write their code in this file.
+// Implementation of a KeyValueServer.
+
 import (
 	"github.com/cmu440/p0partA/kvstore"
-	 "fmt"
-	 "net"
-	  "strconv"
+	"fmt"
+	"net"
+	"strconv"
 	"bufio"
-	"time"
+	"bytes"
+	"io"
 )
 
-const sendChannelBufferSize int = 100
+const MAX_MESSAGE_QUEUE_LENGTH = 500
 
+type QuerryType int
+
+const (
+	T_PUT       QuerryType = 0
+	T_GET       QuerryType = 1
+	T_DELETE    QuerryType = 2
+)
+
+// Stores a connection and corresponding message queue.
+type client struct {
+	connection       net.Conn
+	messageQueue     chan []byte  //用于接收结果
+
+	cQuery chan *db               //查询是不需要 block 
+	cResponse chan *db
+
+	quitSignal_Read  chan int
+	quitSignal_Write chan int
+}
+
+// Used to specify DBRequests
+type db struct {
+	qtype int
+	key   string
+	value []byte
+}
+
+// Implements KeyValueServer.
 type keyValueServer struct {
-	// TODO: implement this!
-	clientNum int
-	listener net.Listener
-	// 用于 维护 conn 和 对应的通道
-	channelMap map[net.Conn]chan []byte
-	// 用于保存 conn 发送过来的msg 的通道
-	readChan chan []byte
+
+	listener          net.Listener
+	currentClients    []*client      //目前的 client 
+
+	newMessage        chan []byte
+	newConnection     chan net.Conn
+
+	deadClient        chan *client   //一次只处理一个 deadClient
+
+	// 原始的dbResponse 和 dbQuerry 所有的client共享
+	dbQuery           chan *db      //用以保存 client 的请求，请求处理后发送给 server
+	dbResponse        chan *db
+
+	dbQuery_1         map[net.Conn]chan *db
+	dbResponse_1	  map[net.Conn]chan *db
+
+	countClients      chan int   //这两个有什么区别
+	clientCount       chan int
+
+	quitSignal_Main   chan int   //通过通道的方式发送信号给routine， 通知其结束
+	quitSignal_Accept chan int   //通过通道的方式发送信号给routine， 通知其结束
+
+	store kvstore.KVStore  // kvstore的具体实现
 }
 
-// New creates and returns (but does not start) a new KeyValueServer.
+// Initializes a new KeyValueServer.
 func New(store kvstore.KVStore) KeyValueServer {
-	// TODO: implement this!
-	var server keyValueServer
 	
-	server.clientNum = 0
-	server.listener = nil
-	server.readChan = make(chan []byte)
-	server.channelMap = make(map[net.Conn]chan []byte)
+	var kvs keyValueServer
+
+	kvs.newMessage = make(chan []byte)
+	kvs.newConnection = make(chan net.Conn)
+
+	kvs.deadClient=make(chan *client)
+
+	kvs.dbQuery=make(chan *db)
+	kvs.dbResponse=make(chan *db)
+
+	kvs.dbQuery_1 = make(map[net.Conn]chan *db)
+	kvs.dbResponse_1 = make(map[net.Conn]chan *db)
+
+	kvs.countClients= make(chan int) 
+	kvs.clientCount= make(chan int)
+
+	kvs.quitSignal_Main=make(chan int)   
 	
+	kvs.quitSignal_Accept= make(chan int)
+	kvs.store = store
+
 	// 使用接口时，返回接口类型变量， 参考 book p113
-	return &server
+	return &kvs
+
 }
 
+// Implementation of Start for keyValueServer.
 func (kvs *keyValueServer) Start(port int) error {
-	// TODO: implement this!
-	laddr := ":" + strconv.Itoa(port)
-
-	// 初始化 监听本地服务, 并将变量赋值给 kvs
-	listener, err := net.Listen("tcp", laddr)
-
-	// A Listener is a generic network listener for stream-oriented protocols.
-	// Multiple goroutines may invoke methods on a Listener simultaneously.
-	// type Listener interface {
-	//     // Accept waits for and returns the next connection to the listener.
-	//     Accept() (Conn, error)
-
-	//     // Close closes the listener.
-	//     // Any blocked Accept operations will be unblocked and return errors.
-	//     Close() error
-
-	//     // Addr returns the listener's network address.
-	//     Addr() Addr
-	// }
-
+	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 	if err != nil {
-		fmt.Println("error in starting a listener!")
-		return nil
+		return err
 	}
 
-	kvs.listener = listener
-	// 进行response 的处理， 也就是 核心代码
+	kvs.listener = ln
+	// init_db()
 
-	go kvs.handleOutStuff()
-
-	go func(){
-        for{
-			// Conn is a generic stream-oriented network connection.
-			// Accept waits for and returns the next connection to the listener.
-			// Accept() (Conn, error)
-            conn,err := kvs.listener.Accept()
-            if err != nil{
-                return
-			}
-			// 新建一个进程意味着，增加一个client
-			fmt.Println("has already added a client")
-			kvs.clientNum++
-
-			// 解析 connection 请求
-            go kvs.readStuff(conn)
-        }
-    }()
+	go runServer(kvs)
+	go acceptRoutine(kvs)
 
 	return nil
 }
 
-func (kvs *keyValueServer) readStuff(conn net.Conn){
-	// 为什么要将 conn 杀掉
-	defer conn.Close()
-
-	bufReader := bufio.NewReader(conn)
-	// 根据某个新建 conn 建立一个 chan, 用于 ? 
-	kvs.channelMap[conn] = make(chan []byte, sendChannelBufferSize)
-
-	// 处理 client 发送过来的请求
-	go kvs.sendStuff(conn)
-
-	// 根据conn 发送response
-	for{
-		// func (b *Reader) ReadBytes(delim byte) ([]byte, error)
-		// ReadBytes reads until the first occurrence of delim in the input, 
-		// returning a slice containing the data up to and including the delimiter. 
-		// If ReadBytes encounters an error before finding a delimiter, 
-		// it returns the data read before the error and the error itself (often io.EOF). 
-		// ReadBytes returns err != nil if and only if the returned data does not end in delim.
-		// For simple uses, a Scanner may be more convenient.
-
-		line, err := bufReader.ReadBytes('\n')
-
-		if err != nil{
-			fmt.Println("erro @ ReadBytes_parseResq")
-			delete(kvs.channelMap, conn)
-			kvs.clientNum--
-			break
-		}
-		// 写给服务器
-		// 为什么长度总是 0
-		// fmt.Println("readStuff:kvs.readChan:", len(kvs.readChan))
-		kvs.readChan<-line
-
-	}
-}
-
-func (kvs *keyValueServer) sendStuff(conn net.Conn){
-	// channelMap map[net.Conn] chan []byte
-	sendChannel, exists := kvs.channelMap[conn]
-	if !exists{
-		fmt.Println("error @ sendStuff: error when get value by key")
-		return
-	}
-	for{
-		// 从 channel 中 读数据，读到msg变量中, 发送回 client
-		msg := <- sendChannel
-		// conn 可以read 也可以 write, interesting 
-		_, err := conn.Write(msg)
-		if err != nil{
-			delete(kvs.channelMap, conn)
-		}
-	}
-}
-
-
-func (kvs *keyValueServer) handleOutStuff(){
-	for {
-		msg := <-kvs.readChan
-		fmt.Println("handleOutStuff:total clients:",len(kvs.channelMap))
-		for _, sendChan := range kvs.channelMap{
-			// buffer channedl 的处理很新奇
-			if len(sendChan) < sendChannelBufferSize{
-				sendChan <-msg
-			} else {
-				time.Sleep(time.Duration(10)*time.Millisecond)}
-		}
-	}
-}
-
-
+// Implementation of Close for keyValueServer.
 func (kvs *keyValueServer) Close() {
-	// TODO: implement this!
-	if kvs.listener != nil{
-		kvs.listener.Close()
-	}
-	kvs.clientNum = 0
+	kvs.listener.Close()
+	kvs.quitSignal_Main <- 0
+	kvs.quitSignal_Accept <- 0
 }
 
+// Implementation of Count.
+func (kvs *keyValueServer) Count() int {
+	kvs.countClients <- 0
+	return <-kvs.clientCount
+}
+
+
+// 仅仅实现了 伪 接口
 func (kvs *keyValueServer) CountActive() int {
 	// TODO: implement this!
-	fmt.Println("in CountActive function",kvs.clientNum)
-	return kvs.clientNum
+	kvs.countClients <- 0
+	return 0
 }
 
 func (kvs *keyValueServer) CountDropped() int {
 	// TODO: implement this!
 
-	fmt.Println("in CountDropped function",kvs.clientNum)
-	return kvs.clientNum
+	kvs.countClients <- 0
+	return 0
 }
 
-// TODO: add additional methods/functions below!
+// Main server routine.
+func runServer(kvs *keyValueServer) {
+	// defer fmt.Println("\"runServer\" ended.")
+
+	for {
+		select {
+		// Send the message to each client's queue.
+		case newMessage := <-kvs.newMessage:
+			for _, c := range kvs.currentClients {
+				// If the queue is full, drop the oldest message.
+				// 确定下是 丢掉最老的，还是最新的数据
+				if len(c.messageQueue) == MAX_MESSAGE_QUEUE_LENGTH {
+					<-c.messageQueue
+				}
+				// 所有的client 接收的信息都是 相同的
+				c.messageQueue <- newMessage
+			}
+		// Add a new client to the client list.
+
+
+		case newConnection := <-kvs.newConnection:
+			fmt.Println("create a client ")
+			c := &client{
+				newConnection,
+				make(chan []byte, MAX_MESSAGE_QUEUE_LENGTH),
+				make(chan *db),
+				make(chan *db, MAX_MESSAGE_QUEUE_LENGTH),
+				make(chan int),
+				make(chan int)}
+			kvs.currentClients = append(kvs.currentClients, c)
+			fmt.Println("# of currentClients", len(kvs.currentClients))
+			go readRoutine(kvs, c)
+			go writeRoutine(c)
+
+		// Remove the dead client.
+		case deadClient := <-kvs.deadClient:
+			for i, c := range kvs.currentClients {
+				if c == deadClient {
+					kvs.currentClients =
+						append(kvs.currentClients[:i], kvs.currentClients[i+1:]...)
+					break
+				}
+			}
+
+		// Run a query on the DB
+		case request := <-kvs.dbQuery:
+			// response required for GET query
+			// if request.isGet {
+			// 	v := kvs.store.Get(request.key)
+			// 	for _,item := range v{
+			// 		kvs.dbResponse <- &db{
+			// 			value: item,
+			// 		}
+			// 	}
+			// } else {
+			// 	kvs.store.Put(request.key, request.value)
+			// }
+			x := 1
+
+		// Get the number of clients.
+		case <-kvs.countClients:
+			kvs.clientCount <- len(kvs.currentClients)
+
+		// End each client routine.
+		case <-kvs.quitSignal_Main:
+			for _, c := range kvs.currentClients {
+				c.connection.Close()
+				c.quitSignal_Write <- 0
+				c.quitSignal_Read <- 0
+			}
+			
+		return
+
+		}
+	}
+}
+
+// One running instance; accepts new clients and sends them to the server.
+func acceptRoutine(kvs *keyValueServer) {
+	defer fmt.Println("\"acceptRoutine\" ended.")
+
+	for {
+		select {
+		case <-kvs.quitSignal_Accept:
+			return
+		default:
+			conn, err := kvs.listener.Accept()
+			//为每个新建的 client 创建两个用于 数据查询 的通道
+
+			// dbQuery_1 map[net.Conn]chan *db
+			// dbResponse_1 map[net.Conn]chan *db
+			kvs.dbQuery_1[conn] = make(chan []byte, sendChannelBufferSize)
+
+			if err == nil {
+				kvs.newConnection <- conn
+			}
+		}
+	}
+}
+
+// One running instance for each client; reads in
+// new  messages and sends them to the server.
+
+func readRoutine(kvs *keyValueServer, c *client) {
+	defer fmt.Println("\"readRoutine\" ended.")
+
+	clientReader := bufio.NewReader(c.connection)
+
+	// Read in messages.
+	for {
+		select {
+		case <-c.quitSignal_Read:
+			return
+		default:
+			message, err := clientReader.ReadBytes('\n')
+			// 为什么读到 EOF的时候，就可以判断某个client 死亡呢？
+			if err == io.EOF {
+				kvs.deadClient <- c
+			// 普通的 err 不需要杀掉 client，直接return的话， 会有什么影响
+			} else if err != nil {
+				return
+			} else {
+				tokens := bytes.Split(message, []byte(":"))
+				if string(tokens[0]) == "Put" {
+					key := string(tokens[1][:])
+
+					// do a "put" query
+					kvs.dbQuery <- &db{
+						qtype: T_PUT,
+						key:   key,
+						value: tokens[2],
+					}
+				} else if string(tokens[0]) == "Get" {
+					// remove trailing \n from get,key\n request
+					keyBin := tokens[1][:len(tokens[1])-1]
+					key := string(keyBin[:])
+					
+					// 首先发送 去query 请求，然后等待response
+					// do a "get" query
+					kvs.dbQuery <- &db{
+						qtype: T_GET,
+						key:   key,
+					}
+
+					response := <-kvs.dbResponse
+					// 后面跟的 ... 代表什么意思
+					// 原始的代码里面 是将同一信息发送给 所有的client端，实际上不需要这样
+					// kvs.newMessage <- append(append(keyBin, ":"...), response.value...)
+					// 个性化， 数据仅发送给需要的 client 里面
+					c.messageQueue <- append(append(keyBin, ":"...), response.value...)
+
+				} else if string(tokens[0]) == "Delete" {
+					keyBin := tokens[1][:len(tokens[1])-1]
+					key := string(keyBin[:])
+
+					kvs.dbQuery <- &db{
+						qtype: T_DELETE,
+						key:   key,
+					}
+				}
+			}
+		}
+	}
+}
+
+// One running instance for each client; writes messages
+// from the message queue to the client.
+func writeRoutine(c *client) {
+	defer fmt.Println("\"writeRoutine\" ended.")
+
+	for {
+		select {
+		case <-c.quitSignal_Write:
+			return
+		// c.messageQueue 从client的 messageQueue 中读取数据， messageQueue 从 readRoutine 获取
+		case message := <-c.messageQueue:
+			fmt.Println("message in client messageQueue from readRoutine: ", string(message))
+			item:=append(message, (byte)('\n'))
+			// item=append(item, '\n')
+			_, err := c.connection.Write(item)
+			if err != nil{
+				fmt.Println("error @ readRoutine")
+			}
+
+		}
+	}
+
+}

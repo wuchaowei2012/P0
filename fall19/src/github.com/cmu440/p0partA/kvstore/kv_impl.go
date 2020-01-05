@@ -6,7 +6,8 @@ type impl struct {
 	internal map[string][]([]byte)
 }
 
-// CreateWithBackdoor -- Used by tests to create a KVStore implementation while keeping a handle on inner storage
+// CreateWithBackdoor -- Used by tests to create a KVStore implementation 
+// while keeping a handle on inner storage
 func CreateWithBackdoor() (KVStore, map[string][]([]byte)) {
 	internal := make(map[string][]([]byte))
 	return impl{internal}, internal
