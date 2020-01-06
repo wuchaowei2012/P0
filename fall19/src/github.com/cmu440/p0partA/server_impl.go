@@ -85,13 +85,7 @@ func New(store kvstore.KVStore) KeyValueServer {
 
 	kvs.deadClient=make(chan *client)
 
-	// kvs.dbQuery=make(chan *db)
-	// kvs.dbResponse=make(chan *db)
-
-	// kvs.dbQuery_1 = make(map[net.Conn]chan *db_conn)
 	kvs.dbQuery_1 = make(chan *db_conn)
-
-
 	kvs.dbResponse_1 = make(map[net.Conn]chan []byte)
 
 	kvs.countClients= make(chan int) 
@@ -115,7 +109,8 @@ func (kvs *keyValueServer) Start(port int) error {
 	}
 
 	kvs.listener = ln
-	// init_db()
+
+	kvs.dbQuery_1= make(chan *db_conn, MAX_MESSAGE_QUEUE_LENGTH)
 
 	go runServer(kvs)
 	go acceptRoutine(kvs)
@@ -132,21 +127,27 @@ func (kvs *keyValueServer) Close() {
 
 // Implementation of Count.
 func (kvs *keyValueServer) Count() int {
-	kvs.countClients <- 0
-	return <-kvs.clientCount
+	// kvs.countClients <- 0
+	// return <-kvs.clientCount
+	fmt.Println("len(kvs.currentClients)", len(kvs.currentClients))
+	return len(kvs.currentClients)
 }
 
 
 // 仅仅实现了 伪 接口
 func (kvs *keyValueServer) CountActive() int {
 	// TODO: implement this!
-	kvs.countClients <- 0
-	return 0
+	// kvs.countClients <- 0
+	// return <-kvs.countClients
+
+	fmt.Println("len(kvs.currentClients)", len(kvs.currentClients))
+	return len(kvs.currentClients)
 }
 
 func (kvs *keyValueServer) CountDropped() int {
 	// TODO: implement this!
-	kvs.countClients <- 0
+	// kvs.countClients <- 0
+	// return <-kvs.countClients
 	return 0
 }
 
@@ -156,64 +157,57 @@ func runServer(kvs *keyValueServer) {
 
 	for {
 		select {
-		// Send the message to each client's queue.
-		// 所有的client 接收的信息都是 相同的
-		/*
-		case newMessage := <-kvs.newMessage:
-			for _, c := range kvs.currentClients {
-				// If the queue is full, drop the oldest message.
-				// 确定下是 丢掉最老的，还是最新的数据
-				if len(c.messageQueue) == MAX_MESSAGE_QUEUE_LENGTH {
-					<-c.messageQueue
-				}
-				c.messageQueue <- newMessage
-			}
-		*/
-
 		// Add a new client to the client list.
 		case newConnection := <-kvs.newConnection:
 			fmt.Println("create a client ")
 			// 为新建立的client 创建两个通道
-
-			kvs.dbQuery_1= make(chan *db_conn, MAX_MESSAGE_QUEUE_LENGTH)
+			
 			kvs.dbResponse_1[newConnection] = make(chan []byte, MAX_MESSAGE_QUEUE_LENGTH)
 
 			// 用于管理server的所有clients
 			c := &client{
 				newConnection,
-				// make(chan []byte, MAX_MESSAGE_QUEUE_LENGTH),
 				make(chan int),
-				make(chan int)}
+				make(chan int),
+			}
+
 			kvs.currentClients = append(kvs.currentClients, c)
 
-			fmt.Println("# of currentClients", len(kvs.currentClients))
+			fmt.Println("# of currentClients: ", len(kvs.currentClients))
+
 			go readRoutine(kvs, c)
 			go writeRoutine(kvs, c)
 
 		// Remove the dead client.
 		case deadClient := <-kvs.deadClient:
+			fmt.Println("trying to delete a dead client from kvs.currentClients")
 			for i, c := range kvs.currentClients {
 				if c == deadClient {
 					kvs.currentClients = append(kvs.currentClients[:i], kvs.currentClients[i+1:]...)
+					fmt.Println("there are clients left alive:", len(kvs.currentClients))
 					break
 				}
 			}
 
-		// Run a query on the DB
-		// server中
 		case request := <-kvs.dbQuery_1:
-			// response required for GET query
-			if request.db_v.type ==  T_GET{
-				v := kvs.store.Get(request.key)
+			if request.db_v.qtype ==  T_GET{
+				v := kvs.store.Get(request.db_v.key)
+				
+				fmt.Println("dbQuerry type: Get value #:", len(v))
+				fmt.Println("dbQuerry key:  :", request.db_v.key)
+
 				for _,item := range v{
-					kvs.dbResponse <- &db{
-						value: item,
-					}
+					kvs.dbResponse_1[request.connection] <- item
+					fmt.Println("getting item:", item)
 				}
-			} else {
-				kvs.store.Put(request.key, request.value)
+			} else if request.db_v.qtype ==  T_PUT {
+				fmt.Println("dbQuerry type: Put key:", request.db_v.key)
+
+				kvs.store.Put(request.db_v.key, request.db_v.value)
+			} else if request.db_v.qtype ==  T_DELETE {
+				fmt.Println("dbQuerry type: Delete key:", request.db_v.key)
+				kvs.store.Clear(request.db_v.key)
 			}
-			fmt.Println(request)
 
 		// Get the number of clients.
 		case <-kvs.countClients:
@@ -226,7 +220,6 @@ func runServer(kvs *keyValueServer) {
 				c.quitSignal_Write <- 0
 				c.quitSignal_Read <- 0
 			}
-			
 		return
 		}
 	}
@@ -235,7 +228,6 @@ func runServer(kvs *keyValueServer) {
 // One running instance; accepts new clients and sends them to the server.
 func acceptRoutine(kvs *keyValueServer) {
 	defer fmt.Println("\"acceptRoutine\" ended.")
-
 	for {
 		select {
 		case <-kvs.quitSignal_Accept:
@@ -252,6 +244,7 @@ func acceptRoutine(kvs *keyValueServer) {
 
 // One running instance for each client; reads in
 // new  messages and sends them to the server. 读取指令
+
 func readRoutine(kvs *keyValueServer, c *client) {
 	defer fmt.Println("\"readRoutine\" ended.")
 	clientReader := bufio.NewReader(c.connection)
@@ -265,13 +258,20 @@ func readRoutine(kvs *keyValueServer, c *client) {
 			// 为什么读到 EOF的时候，就可以判断某个client 死亡呢？
 			if err == io.EOF {
 				kvs.deadClient <- c
+				fmt.Println("kill a client")
+				c.quitSignal_Read <- 0
+				c.quitSignal_Write <- 0
+
 			// 普通的 err 不需要杀掉 client，直接return的话， 会有什么影响
 			} else if err != nil {
 				return
 			} else {
 				tokens := bytes.Split(message, []byte(":"))
+				
 				if string(tokens[0]) == "Put" {
-					key := string(tokens[1][:])
+					// key := string(tokens[1])
+					key := string(bytes.TrimSuffix(tokens[1], []byte("\n")))
+
 					db_v := db{
 						qtype: T_PUT, 
 						key:   key,
@@ -283,12 +283,9 @@ func readRoutine(kvs *keyValueServer, c *client) {
 					}
 
 				} else if string(tokens[0]) == "Get" {
-					// remove trailing \n from get,key\n request
-					keyBin := tokens[1][:len(tokens[1])-1]
-					key := string(keyBin[:])
-					
-					// 首先发送 去query 请求，然后等待response
-					// ---> dbQuery_1 ---> dbResponse_1
+					// 高风险的地方
+					key := string(bytes.TrimSuffix(tokens[1], []byte("\n")))
+					// 首先发送query 请求，然后等待response ---> dbQuery_1 ---> dbResponse_1
 					db_v := db{
 						qtype: T_GET, 
 						key:   key,
@@ -299,26 +296,17 @@ func readRoutine(kvs *keyValueServer, c *client) {
 						c.connection,
 					}
 
-					response := <-kvs.dbResponse_1[c.connection]
-					// 后面跟的 ... 代表什么意思
-					// c.messageQueue <- append(append(keyBin, ":"...), response.value...)
-
-					// kvs.dbResponse_1[c.connection] <- append(append(keyBin, ":"...), response.value...)
-					fmt.Printf("%c", response)
-
 				} else if string(tokens[0]) == "Delete" {
-					keyBin := tokens[1][:len(tokens[1])-1]
-					key := string(keyBin[:])
-
+					key := string(bytes.TrimSuffix(tokens[1], []byte("\n")))
 					db_v := db{
 						qtype: T_DELETE, 
 						key:   key,
 					}
-
 					kvs.dbQuery_1 <- &db_conn{
 						db_v,
 						c.connection,
 					}
+
 				}
 			}
 		}
@@ -332,19 +320,17 @@ func writeRoutine(kvs *keyValueServer, c *client) {
 
 	for {
 		select {
-		case <-c.quitSignal_Write:
-			return
-		// c.messageQueue 从client的 messageQueue 中读取数据， messageQueue 从 readRoutine 获取
-		case message := <- kvs.dbResponse_1[c.connection]:
-			fmt.Println("message in client messageQueue from readRoutine: ", string(message))
-			item:=append(message, (byte)('\n'))
-			// item=append(item, '\n')
-			_, err := c.connection.Write(item)
-			if err != nil{
-				fmt.Println("error @ readRoutine")
-			}
+			case <-c.quitSignal_Write:
+				return
+			// c.messageQueue 从client的 messageQueue 中读取数据， messageQueue 从 readRoutine 获取
+			// kvs.dbResponse_1[request.connection] <- item
+			case item := <- kvs.dbResponse_1[c.connection]:
+				_, err := c.connection.Write(item)
+				if err != nil{
+					fmt.Println("error @ readRoutine")
+				}
 
-		}
+			}
 	}
 
 }

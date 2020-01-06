@@ -499,15 +499,19 @@ func testBasic(t *testing.T, name string, numClients, numMessages, numDeletes, t
 	}
 
 	allClients := newTestClients(numClients, false)
+	
 	if err := ts.startClients(allClients...); err != nil {
 		t.Errorf("Failed to start clients: %s\n", err)
 		return
 	}
+
 	defer ts.killClients(allClients...)
 
 	// Give the server some time to register the clients before running the test.
 	time.Sleep(time.Duration(defaultStartDelay) * time.Millisecond)
 
+	fmt.Println("server_test:expected clients", numClients)
+	
 	if err := ts.checkCountActive(numClients); err != nil {
 		t.Error(err)
 		return
